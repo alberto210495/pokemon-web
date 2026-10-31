@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PokéInfo</title>
+  <meta name="description" content="Information about every Pokémon, region and game in the series.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <a href="#/" class="logo">
+      <span class="pokeball" aria-hidden="true"></span>
+      PokéInfo
+    </a>
+    <button class="menu-btn" id="menuBtn" aria-label="Open menu">☰</button>
+    <nav id="nav">
+      <a href="#/" data-route="">Home</a>
+      <a href="#/pokedex" data-route="pokedex">Pokédex</a>
+      <a href="#/regions" data-route="regions">Regions</a>
+      <a href="#/games" data-route="games">Games</a>
+      <a href="#/guides" data-route="guides">Guides</a>
+      <a href="#/team" data-route="team">Team</a>
+      <a href="#/compare" data-route="compare">Compare</a>
+    </nav>
+  </header>
+
+  <main id="app"></main>
+
+  <footer class="footer">
+    Pokémon data provided by <a href="https://pokeapi.co" target="_blank" rel="noopener">PokeAPI</a>.
+    Pokémon and Pokémon character names are trademarks of Nintendo, Game Freak and The Pokémon Company. Non-commercial fan site.
+  </footer>
+
+  <script src="js/data.js"></script>
+  <script src="js/guides.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

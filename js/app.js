@@ -1,0 +1,970 @@
+// PokéInfo — single-page app with hash routing.
+// Routes: #/  #/pokedex[/gen]  #/pokemon/:id  #/regions  #/region/:id
+//         #/games  #/game/:id  #/compare[/:a/:b]
+//         #/guides  #/guide/:id[/walkthrough|locations|items]
+//         #/team[/:id,:id,…[/:game]]
+
+const API = 'https://pokeapi.co/api/v2';
+const TOTAL = 1025;
+const SPRITES = 'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon';
+
+const app = document.getElementById('app');
+const cache = new Map();
+
+// ---------- Helpers ----------
+
+// API responses are kept in memory for this visit and saved in the browser for a week,
+// using the Cache API when available (served over http/https) and localStorage otherwise.
+const STORE_NAME = 'pokeinfo-v1';
+const STORE_PREFIX = 'pokeinfo:';
+const MAX_AGE = 7 * 24 * 60 * 60 * 1000;
+
+async function readStored(url) {
+  try {
+    const store = await caches.open(STORE_NAME);
+    const res = await store.match(url);
+    if (res && Date.now() - Number(res.headers.get('x-saved')) < MAX_AGE) return res.json();
+    return null;
+  } catch { /* Cache API unavailable (e.g. file://): fall back to localStorage */ }
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORE_PREFIX + url));
+    return saved && Date.now() - saved.t < MAX_AGE ? saved.d : null;
+  } catch { return null; }
+}
+
+async function writeStored(url, data) {
+  const body = JSON.stringify(data);
+  try {
+    const store = await caches.open(STORE_NAME);
+    await store.put(url, new Response(body, { headers: { 'x-saved': String(Date.now()) } }));
+    return;
+  } catch { /* fall back to localStorage */ }
+  const key = STORE_PREFIX + url;
+  const value = JSON.stringify({ t: Date.now(), d: data });
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    // Storage full: drop our saved responses and try once more.
+    try {
+      Object.keys(localStorage).filter(k => k.startsWith(STORE_PREFIX)).forEach(k => localStorage.removeItem(k));
+      localStorage.setItem(key, value);
+    } catch { /* not cached; that's fine */ }
+  }
+}
+
+function api(url) {
+  const full = url.startsWith('http') ? url : API + url;
+  if (!cache.has(full)) {
+    const req = readStored(full)
+      .then(saved => saved || fetch(full)
+        .then(r => { if (!r.ok) throw new Error(`HTTP ${r.status}`); return r.json(); })
+        .then(data => { writeStored(full, data); return data; }))
+      .catch(err => { cache.delete(full); throw err; });
+    cache.set(full, req);
+  }
+  return cache.get(full);
+}
+
+// Damage multiplier of each attacking type against a Pokémon with the given types.
+const defenses = types => Object.fromEntries(Object.entries(TYPE_CHART).map(([atk, eff]) => [atk,
+  types.reduce((m, t) => m * (eff.zero.includes(t) ? 0 : eff.double.includes(t) ? 2 : eff.half.includes(t) ? 0.5 : 1), 1)]));
+
+const sprite = id => `${SPRITES}/${id}.png`;
+const artwork = (id, shiny = false) => `${SPRITES}/other/official-artwork/${shiny ? 'shiny/' : ''}${id}.png`;
+const pad = id => '#' + String(id).padStart(4, '0');
+const idFromUrl = url => Number(url.split('/').filter(Boolean).pop());
+const cap = s => s.charAt(0).toUpperCase() + s.slice(1);
+
+const NAME_FIXES = {
+  'nidoran-f': 'Nidoran♀', 'nidoran-m': 'Nidoran♂', 'mr-mime': 'Mr. Mime', 'mime-jr': 'Mime Jr.',
+  'mr-rime': 'Mr. Rime', farfetchd: "Farfetch'd", sirfetchd: "Sirfetch'd", 'type-null': 'Type: Null',
+  'ho-oh': 'Ho-Oh', 'porygon-z': 'Porygon-Z', 'jangmo-o': 'Jangmo-o', 'hakamo-o': 'Hakamo-o',
+  'kommo-o': 'Kommo-o', flabebe: 'Flabébé', 'chi-yu': 'Chi-Yu', 'chien-pao': 'Chien-Pao',
+  'ting-lu': 'Ting-Lu', 'wo-chien': 'Wo-Chien',
+};
+const prettyName = slug => NAME_FIXES[slug] || slug.split('-').map(cap).join(' ');
+
+// Full species list (id + name), loaded once.
+let speciesNames = null;
+async function loadSpecies() {
+  if (!speciesNames) {
+    const data = await api(`/pokemon-species?limit=${TOTAL}`);
+    speciesNames = new Map(
+      data.results
+        .map(s => [idFromUrl(s.url), prettyName(s.name)])
+        .filter(([id]) => id <= TOTAL)
+        .sort((a, b) => a[0] - b[0])
+    );
+  }
+  return speciesNames;
+}
+const nameOf = id => (speciesNames && speciesNames.get(id)) || pad(id);
+
+const genOf = id => GENERATIONS.find(g => id >= g.from && id <= g.to);
+const regionById = id => REGIONS.find(r => r.id === id);
+const gameById = id => GAMES.find(g => g.id === id);
+
+// ---------- Reusable components ----------
+
+const imgFallback = id => `onerror="this.onerror=null;this.src='${artwork(id)}'"`;
+
+const pokeCard = id => `
+  <a class="poke" href="#/pokemon/${id}">
+    <img loading="lazy" src="${sprite(id)}" alt="${nameOf(id)}" ${imgFallback(id)}>
+    <div class="num">${pad(id)}</div>
+    <div class="nom">${nameOf(id)}</div>
+  </a>`;
+
+const miniList = ids => `<div class="mini">${ids.map(id => `
+  <a href="#/pokemon/${id}" title="${nameOf(id)}">
+    <img loading="lazy" src="${sprite(id)}" alt="${nameOf(id)}" ${imgFallback(id)}>
+    <div>${nameOf(id)}</div>
+  </a>`).join('')}</div>`;
+
+const typeBadge = t => `<span class="tipo" style="background:${TYPE_COLORS[t] || '#888'}">${cap(t)}</span>`;
+const list = items => `<ul class="lista">${items.map(i => `<li>${i}</li>`).join('')}</ul>`;
+const loading = (msg = 'Loading…') => `<div class="cargando">${msg}</div>`;
+
+// PokeAPI location slugs look like "kanto-route-1" or "mt-moon-b1f".
+const REGION_PREFIX = /^(kanto|johto|hoenn|sinnoh|unova|kalos|alola|galar|hisui|paldea)-/;
+const placeName = slug => slug.replace(REGION_PREFIX, '').replace(/-area$/, '').split('-')
+  .map(w => /^b?\d+f$/.test(w) ? w.toUpperCase() : cap(w)).join(' ');
+
+// Display name of each PokeAPI version slug of a game ("red" → "Red").
+const versionLabels = (g, guide) => Object.fromEntries(guide.versions.map((v, i) =>
+  [v, g.versions && g.versions.length === guide.versions.length ? g.versions[i].name : g.name]));
+
+// ---------- Views ----------
+// Each view returns an HTML string or { html, mount } (mount runs after render).
+
+function home() {
+  const featured = [25, 6, 150, 384, 448, 658][Math.floor(Math.random() * 6)];
+  return {
+    html: `
+      <section class="hero">
+        <div>
+          <h1>Welcome to PokéInfo</h1>
+          <p>Your guide to the Pokémon world: details on every Pokémon, every region and every main-series game, plus what makes each version different.</p>
+          <a class="btn sec" href="#/pokedex">Explore the Pokédex</a>
+          <button class="btn sec" id="randomBtn">🎲 Random Pokémon</button>
+        </div>
+        <img src="${artwork(featured)}" alt="Featured Pokémon">
+      </section>
+
+      <div class="cifras tarjeta">
+        <div class="cifra"><b>${TOTAL}</b><span>Pokémon</span></div>
+        <div class="cifra"><b>${GENERATIONS.length}</b><span>Generations</span></div>
+        <div class="cifra"><b>${REGIONS.length}</b><span>Regions</span></div>
+        <div class="cifra"><b>${GAMES.length}</b><span>Main games</span></div>
+      </div>
+
+      <div class="secciones">
+        <a class="tarjeta seccion" href="#/pokedex"><div class="ico">📕</div><h3>Pokédex</h3><p>Stats, types, abilities and evolutions for all ${TOTAL} Pokémon.</p></a>
+        <a class="tarjeta seccion" href="#/regions"><div class="ico">🗺️</div><h3>Regions</h3><p>From Kanto to Paldea: inspiration, professors, starters and legendaries.</p></a>
+        <a class="tarjeta seccion" href="#/games"><div class="ico">🎮</div><h3>Games</h3><p>Every main-series game, its new features and version exclusives.</p></a>
+        <a class="tarjeta seccion" href="#/guides"><div class="ico">📖</div><h3>Guides</h3><p>Walkthroughs, routes, wild Pokémon locations and key items for each game.</p></a>
+        <a class="tarjeta seccion" href="#/team"><div class="ico">🛡️</div><h3>Team builder</h3><p>Build a team of six and spot its weaknesses and coverage gaps.</p></a>
+        <a class="tarjeta seccion" href="#/compare"><div class="ico">⚖️</div><h3>Compare</h3><p>Put two games side by side and see how they differ.</p></a>
+      </div>`,
+    mount() {
+      document.getElementById('randomBtn').onclick = () => {
+        location.hash = `#/pokemon/${1 + Math.floor(Math.random() * TOTAL)}`;
+      };
+    },
+  };
+}
+
+// Pokédex filters persist while navigating.
+const dex = { q: '', gen: '', type: '' };
+
+async function pokedex(genParam) {
+  if (genParam) dex.gen = genParam;
+  await loadSpecies();
+
+  return {
+    html: `
+      <h1>Pokédex</h1>
+      <p class="subtitulo">Search by name or number, or filter by generation and type.</p>
+      <div class="filtros">
+        <input id="q" type="search" placeholder="Search: Pikachu, 25…" value="${dex.q}">
+        <select id="gen">
+          <option value="">All generations</option>
+          ${GENERATIONS.map(g => `<option value="${g.n}" ${dex.gen == g.n ? 'selected' : ''}>Gen ${g.n} — ${regionById(g.region).name}</option>`).join('')}
+        </select>
+        <select id="type">
+          <option value="">All types</option>
+          ${Object.keys(TYPE_COLORS).map(t => `<option value="${t}" ${dex.type === t ? 'selected' : ''}>${cap(t)}</option>`).join('')}
+        </select>
+        <button class="btn sec" id="clear">Clear</button>
+      </div>
+      <div class="contador" id="count"></div>
+      <div class="rejilla" id="grid"></div>`,
+    mount() {
+      const q = document.getElementById('q');
+      const gen = document.getElementById('gen');
+      const type = document.getElementById('type');
+      let timer;
+      q.oninput = () => { clearTimeout(timer); timer = setTimeout(() => { dex.q = q.value; applyFilters(); }, 150); };
+      gen.onchange = () => { dex.gen = gen.value; applyFilters(); };
+      type.onchange = () => { dex.type = type.value; applyFilters(); };
+      document.getElementById('clear').onclick = () => {
+        dex.q = dex.gen = dex.type = '';
+        q.value = gen.value = type.value = '';
+        applyFilters();
+      };
+      applyFilters();
+    },
+  };
+}
+
+async function applyFilters() {
+  const grid = document.getElementById('grid');
+  const count = document.getElementById('count');
+  let ids = [...speciesNames.keys()];
+
+  if (dex.gen) {
+    const g = GENERATIONS.find(x => x.n == dex.gen);
+    ids = ids.filter(id => id >= g.from && id <= g.to);
+  }
+  if (dex.type) {
+    grid.innerHTML = loading('Filtering by type…');
+    try {
+      const data = await api(`/type/${dex.type}`);
+      const ofType = new Set(data.pokemon.map(p => idFromUrl(p.pokemon.url)));
+      ids = ids.filter(id => ofType.has(id));
+    } catch {
+      grid.innerHTML = '<div class="error">Could not load the type filter.</div>';
+      return;
+    }
+  }
+  const q = dex.q.trim().toLowerCase().replace(/^#0*/, '');
+  if (q) ids = ids.filter(id => nameOf(id).toLowerCase().includes(q) || String(id) === q);
+
+  if (!document.body.contains(grid)) return; // user navigated away
+  count.textContent = `${ids.length} Pokémon`;
+  grid.innerHTML = ids.length ? ids.map(pokeCard).join('') : '<p class="subtitulo">No Pokémon match your search.</p>';
+}
+
+function evolutionStages(node, depth = 0, out = []) {
+  (out[depth] = out[depth] || []).push(idFromUrl(node.species.url));
+  node.evolves_to.forEach(n => evolutionStages(n, depth + 1, out));
+  return out;
+}
+
+async function pokemonDetail(param) {
+  const id = parseInt(param, 10);
+  if (!id || id < 1 || id > TOTAL) return notFound();
+
+  const [p, s] = await Promise.all([api(`/pokemon/${id}`), api(`/pokemon-species/${id}`), loadSpecies()]);
+  const chain = await api(s.evolution_chain.url).catch(() => null);
+
+  const en = arr => arr.filter(x => x.language.name === 'en');
+  const name = (en(s.names)[0] || {}).name || nameOf(id);
+  const genus = (en(s.genera)[0] || {}).genus || '';
+  const flavors = en(s.flavor_text_entries);
+  const flavor = flavors.length ? flavors[flavors.length - 1].flavor_text.replace(/[\f\n\r]+/g, ' ') : '';
+  const gen = genOf(id);
+  const region = regionById(gen.region);
+  const totalStats = p.stats.reduce((sum, st) => sum + st.base_stat, 0);
+  const mult = defenses(p.types.map(t => t.type.name));
+  const matchups = [[4, 'Takes ×4 from'], [2, 'Takes ×2 from'], [0.5, 'Takes ×½ from'], [0.25, 'Takes ×¼ from'], [0, 'Immune to']]
+    .map(([m, label]) => [label, Object.keys(mult).filter(t => mult[t] === m)])
+    .filter(([, types]) => types.length);
+  const cry = p.cries && (p.cries.latest || p.cries.legacy);
+  const stages = chain ? evolutionStages(chain.chain).map(st => st.filter(x => x <= TOTAL)) : [];
+  const exclusiveIn = GAMES.flatMap(g => (g.versions || [])
+    .filter(v => v.pokemon.includes(id) && !g.versions.every(o => o.pokemon.includes(id)))
+    .map(v => `<a class="chip" href="#/game/${g.id}">Pokémon ${v.name}</a>`));
+
+  const tags = [];
+  if (s.is_legendary) tags.push('<span class="chip">⭐ Legendary</span>');
+  if (s.is_mythical) tags.push('<span class="chip">✨ Mythical</span>');
+  if (s.is_baby) tags.push('<span class="chip">🍼 Baby</span>');
+
+  return {
+    html: `
+      <a class="volver" href="#/pokedex">← Back to Pokédex</a>
+      <div class="detalle">
+        <div class="tarjeta ficha">
+          <div class="num">${pad(id)}</div>
+          <h1>${name}</h1>
+          <p class="genero">${genus}</p>
+          <img class="arte" id="art" src="${artwork(id)}" alt="${name}">
+          <div class="tipos">${p.types.map(t => typeBadge(t.type.name)).join('')}</div>
+          ${tags.length ? `<div class="lista-chips" style="justify-content:center">${tags.join('')}</div>` : ''}
+          <div class="acciones">
+            <button class="btn sec" id="shinyBtn">✨ View shiny</button>
+            ${cry ? '<button class="btn sec" id="cryBtn">🔊 Cry</button>' : ''}
+            <button class="btn sec" id="teamBtn">➕ Add to team</button>
+          </div>
+        </div>
+
+        <div>
+          <div class="tarjeta">
+            <p style="margin-top:0">${flavor}</p>
+            <div class="datos">
+              <div class="dato"><small>Height</small><b>${(p.height / 10).toFixed(1)} m</b></div>
+              <div class="dato"><small>Weight</small><b>${(p.weight / 10).toFixed(1)} kg</b></div>
+              <div class="dato"><small>Generation</small><b>Gen ${gen.n}</b></div>
+              <div class="dato"><small>Region</small><b><a href="#/region/${region.id}">${region.name}</a></b></div>
+              <div class="dato"><small>Catch rate</small><b>${s.capture_rate}</b></div>
+              <div class="dato"><small>Egg groups</small><b>${s.egg_groups.map(e => prettyName(e.name)).join(', ') || '—'}</b></div>
+            </div>
+            <h2>Abilities</h2>
+            <div class="lista-chips">
+              ${p.abilities.map(a => `<span class="chip">${prettyName(a.ability.name)}${a.is_hidden ? ' (hidden)' : ''}</span>`).join('')}
+            </div>
+          </div>
+
+          <div class="tarjeta" style="margin-top:16px">
+            <h2 style="margin-top:0">Base stats <small style="color:var(--suave)">(total ${totalStats})</small></h2>
+            ${p.stats.map(st => {
+              const v = st.base_stat;
+              const color = v < 60 ? '#f34444' : v < 90 ? '#ffb000' : v < 120 ? '#3fa129' : '#2980ef';
+              return `<div class="stat"><span>${STAT_NAMES[st.stat.name]}</span><b>${v}</b>
+                <div class="barra"><div style="width:${Math.min(100, v / 2.55)}%;background:${color}"></div></div></div>`;
+            }).join('')}
+          </div>
+
+          <div class="tarjeta" style="margin-top:16px">
+            <h2 style="margin-top:0">Type effectiveness</h2>
+            ${matchups.map(([label, types]) => `
+              <div class="eficacia"><span>${label}</span><div class="tipos-fila">${types.map(typeBadge).join('')}</div></div>`).join('')}
+            <p class="nota">Based on type only; abilities like Levitate or Flash Fire can change this.</p>
+          </div>
+        </div>
+      </div>
+
+      ${stages.length > 1 ? `
+        <h2>Evolution chain</h2>
+        <div class="evoluciones">
+          ${stages.map(st => `<div class="evoluciones">${st.map(pokeCard).join('')}</div>`).join('<span class="flecha">→</span>')}
+        </div>` : ''}
+
+      ${exclusiveIn.length ? `<h2>Version exclusive in</h2><div class="lista-chips">${exclusiveIn.join('')}</div>` : ''}
+
+      <h2>Where to find</h2>
+      <div id="donde">${loading('Loading locations…')}</div>
+
+      <div class="navpoke">
+        ${id > 1 ? `<a class="btn sec" href="#/pokemon/${id - 1}">← ${pad(id - 1)} ${nameOf(id - 1)}</a>` : '<span></span>'}
+        ${id < TOTAL ? `<a class="btn sec" href="#/pokemon/${id + 1}">${nameOf(id + 1)} ${pad(id + 1)} →</a>` : ''}
+      </div>`,
+    mount() {
+      let shiny = false;
+      const art = document.getElementById('art');
+      const btn = document.getElementById('shinyBtn');
+      btn.onclick = () => {
+        shiny = !shiny;
+        art.src = artwork(id, shiny);
+        btn.textContent = shiny ? '🎨 View normal' : '✨ View shiny';
+      };
+      const cryBtn = document.getElementById('cryBtn');
+      if (cryBtn) cryBtn.onclick = () => { const a = new Audio(cry); a.volume = 0.4; a.play(); };
+      document.getElementById('teamBtn').onclick = () => {
+        const ids = loadSavedTeam();
+        if (ids.length >= TEAM_SIZE && !ids.includes(id)) { alert('Your team is full. Remove a Pokémon first.'); return; }
+        location.hash = teamHash([...new Set([...ids, id])], loadSavedGame());
+      };
+      loadWhereToFind(id);
+    },
+  };
+}
+
+async function loadWhereToFind(id) {
+  let encs;
+  try { encs = await api(`/pokemon/${id}/encounters`); } catch { encs = null; }
+  const box = document.getElementById('donde');
+  if (!box) return; // user navigated away
+  if (!encs) { box.innerHTML = '<p class="subtitulo">Could not load location data.</p>'; return; }
+
+  const blocks = GAMES.filter(g => GUIDES[g.id]).map(g => {
+    const guide = GUIDES[g.id];
+    const places = encs.map(e => {
+      const details = e.version_details.filter(vd => guide.versions.includes(vd.version.name)).flatMap(vd => vd.encounter_details);
+      if (!details.length) return null;
+      const min = Math.min(...details.map(d => d.min_level));
+      const max = Math.max(...details.map(d => d.max_level));
+      const methods = [...new Set(details.map(d => prettyName(d.method.name)))].join(', ');
+      return `<li><b>${placeName(e.location_area.name)}</b> — ${methods}, Lv. ${min === max ? min : `${min}–${max}`}</li>`;
+    }).filter(Boolean);
+    guide.gifts.filter(gift => gift.id === id).forEach(gift => places.push(`<li><b>Gift</b> — ${gift.where}</li>`));
+    if (!places.length) return '';
+    return `
+      <details class="tarjeta desplegable">
+        <summary>Pokémon ${g.name} <small>${places.length} location${places.length > 1 ? 's' : ''}</small></summary>
+        ${list(places)}
+        <a class="chip" href="#/guide/${g.id}/locations">Open the ${g.name} guide</a>
+      </details>`;
+  }).join('');
+
+  box.innerHTML = blocks || '<p class="subtitulo">No wild encounters recorded. It may only be obtainable by evolving, breeding, trading or events.</p>';
+}
+
+async function regions() {
+  await loadSpecies().catch(() => {});
+  return `
+    <h1>Regions</h1>
+    <p class="subtitulo">Each generation introduces a new region, inspired by a real-world place.</p>
+    <div class="regiones">
+      ${REGIONS.map(r => `
+        <a class="tarjeta region" href="#/region/${r.id}">
+          <div class="banda" style="background:${r.color}"></div>
+          <div class="cuerpo">
+            <h3>${r.name}</h3>
+            <div class="meta">Gen ${r.gen} · Based on ${r.basedOn}</div>
+            <div class="sprites">${r.starters.map(id => `<img loading="lazy" src="${sprite(id)}" alt="${nameOf(id)}">`).join('')}</div>
+          </div>
+        </a>`).join('')}
+    </div>`;
+}
+
+async function regionDetail(id) {
+  const r = regionById(id);
+  if (!r) return notFound();
+  await loadSpecies().catch(() => {});
+  const gen = GENERATIONS.find(g => g.region === r.id);
+
+  return `
+    <a class="volver" href="#/regions">← All regions</a>
+    <div class="cabecera-region" style="border-color:${r.color}">
+      <h1>${r.name}</h1>
+      <p class="subtitulo" style="margin:0">Generation ${r.gen} · Based on ${r.basedOn} · ${r.professor}</p>
+    </div>
+    <div class="tarjeta">
+      <p style="margin-top:0">${r.description}</p>
+      ${list(r.facts)}
+    </div>
+
+    <h2>Starter Pokémon</h2>
+    ${miniList(r.starters)}
+
+    <h2>Legendary & Mythical Pokémon</h2>
+    ${miniList(r.legendaries)}
+
+    <h2>Games set in ${r.name}</h2>
+    <div class="lista-chips">
+      ${r.games.map(gid => { const g = gameById(gid); return `<a class="chip" href="#/game/${g.id}">${g.name} (${g.year})</a>`; }).join('')}
+    </div>
+
+    ${gen ? `<h2>Pokédex</h2><a class="btn" href="#/pokedex/${gen.n}">View the ${gen.to - gen.from + 1} Pokémon introduced in Gen ${gen.n}</a>` : ''}`;
+}
+
+async function games() {
+  await loadSpecies().catch(() => {});
+  const gens = [...new Set(GAMES.map(g => g.gen))];
+  return `
+    <h1>Games</h1>
+    <p class="subtitulo">All main-series games in release order. Click one to see its features and version differences.</p>
+    ${gens.map(n => `
+      <section class="linea-gen">
+        <h2>Generation ${n} <a class="chip" href="#/region/${GENERATIONS[n - 1].region}">${regionById(GENERATIONS[n - 1].region).name}</a></h2>
+        <div class="juegos">
+          ${GAMES.filter(g => g.gen === n).map(g => gameCard(g)).join('')}
+        </div>
+      </section>`).join('')}`;
+}
+
+const gameCard = (g, href = `#/game/${g.id}`) => `
+  <a class="tarjeta juego" href="${href}">
+    <div class="portadas">${g.cover.map(id => `<img loading="lazy" src="${artwork(id)}" alt="${nameOf(id)}">`).join('')}</div>
+    <div>
+      <h3>Pokémon ${g.name}</h3>
+      <small>${g.year} · ${g.platform}</small><br>
+      <span class="etiqueta">${g.type}</span>
+    </div>
+  </a>`;
+
+async function gameDetail(id) {
+  const g = gameById(id);
+  if (!g) return notFound();
+  await loadSpecies().catch(() => {});
+  const region = regionById(g.region);
+  const others = GAMES.filter(x => x.region === g.region && x.id !== g.id);
+
+  return `
+    <a class="volver" href="#/games">← All games</a>
+    <div class="tarjeta juego" style="margin-bottom:20px">
+      <div class="portadas">${g.cover.map(cid => `<img src="${artwork(cid)}" alt="${nameOf(cid)}" style="width:90px;height:90px">`).join('')}</div>
+      <div>
+        <h1>Pokémon ${g.name}</h1>
+        <p class="subtitulo" style="margin:0">${g.year} · ${g.platform} · Generation ${g.gen} · <a href="#/region/${region.id}">${region.name}</a> · <span class="etiqueta">${g.type}</span></p>
+        ${GUIDES[g.id] ? `<a class="btn" href="#/guide/${g.id}" style="margin-top:10px">📖 Open game guide</a>` : ''}
+      </div>
+    </div>
+
+    <div class="tarjeta">
+      <p style="margin-top:0">${g.summary}</p>
+      <p><b>Key mechanic:</b> ${g.mechanic}</p>
+      <h2>What's new</h2>
+      ${list(g.features)}
+      <h2>Differences</h2>
+      ${list(g.differences)}
+    </div>
+
+    ${g.versions ? `
+      <h2>Version exclusives</h2>
+      <div class="versiones">
+        ${g.versions.map(v => `<div class="tarjeta version"><h3>Pokémon ${v.name}</h3>${miniList(v.pokemon)}</div>`).join('')}
+      </div>` : '<h2>Single edition</h2><p class="subtitulo">This game has only one version, so there are no version exclusives.</p>'}
+
+    ${others.length ? `
+      <h2>Other games in ${region.name}</h2>
+      <div class="lista-chips">
+        ${others.map(o => `<a class="chip" href="#/compare/${g.id}/${o.id}">Compare with ${o.name}</a>`).join('')}
+      </div>` : ''}`;
+}
+
+async function compare(aId, bId) {
+  await loadSpecies().catch(() => {});
+  const a = gameById(aId) || GAMES[0];
+  const b = gameById(bId) || GAMES[GAMES.length - 1];
+  const options = sel => GAMES.map(g => `<option value="${g.id}" ${g.id === sel.id ? 'selected' : ''}>${g.name} (${g.year})</option>`).join('');
+
+  const versionsText = g => g.versions ? g.versions.map(v => v.name).join(' / ') : 'Single edition';
+  const rows = [
+    ['Year', g => g.year],
+    ['Platform', g => g.platform],
+    ['Generation', g => `Gen ${g.gen}`],
+    ['Region', g => `<a href="#/region/${g.region}">${regionById(g.region).name}</a>`],
+    ['Type', g => g.type],
+    ['Versions', versionsText],
+    ['Key mechanic', g => g.mechanic],
+    ['Cover Pokémon', g => g.cover.map(id => `<img src="${artwork(id)}" alt="${nameOf(id)}" title="${nameOf(id)}">`).join('')],
+    ['What\'s new', g => list(g.features)],
+    ['Differences', g => list(g.differences)],
+  ];
+
+  return {
+    html: `
+      <h1>Compare games</h1>
+      <p class="subtitulo">Pick two games to see them side by side. Highlighted rows are different.</p>
+      <div class="selectores">
+        <select class="sel" id="selA">${options(a)}</select>
+        <span class="vs">VS</span>
+        <select class="sel" id="selB">${options(b)}</select>
+      </div>
+      <div class="tabla-wrap">
+        <table class="comparar">
+          <thead><tr><th></th><td><a href="#/game/${a.id}">Pokémon ${a.name}</a></td><td><a href="#/game/${b.id}">Pokémon ${b.name}</a></td></tr></thead>
+          <tbody>
+            ${rows.map(([label, fn]) => {
+              const va = fn(a), vb = fn(b);
+              const cls = va !== vb ? ' class="distinto"' : '';
+              return `<tr><th>${label}</th><td${cls}>${va}</td><td${cls}>${vb}</td></tr>`;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>`,
+    mount() {
+      const selA = document.getElementById('selA');
+      const selB = document.getElementById('selB');
+      selA.onchange = selB.onchange = () => { location.hash = `#/compare/${selA.value}/${selB.value}`; };
+    },
+  };
+}
+
+// ---------- Game guides ----------
+
+async function guides() {
+  await loadSpecies().catch(() => {});
+  const gens = [...new Set(GAMES.map(g => g.gen))];
+  return `
+    <h1>Game guides</h1>
+    <p class="subtitulo">Walkthroughs, routes, wild Pokémon locations, key items and gift Pokémon for each game.</p>
+    ${gens.map(n => `
+      <section class="linea-gen">
+        <h2>Generation ${n}</h2>
+        <div class="juegos">
+          ${GAMES.filter(g => g.gen === n && GUIDES[g.id]).map(g => gameCard(g, `#/guide/${g.id}`)).join('')}
+        </div>
+      </section>`).join('')}`;
+}
+
+const GUIDE_TABS = { walkthrough: 'Walkthrough', locations: 'Routes & wild Pokémon', items: 'Items & gifts' };
+
+async function guideView(id, tab = 'walkthrough') {
+  const g = gameById(id);
+  const guide = GUIDES[id];
+  if (!g || !guide || !GUIDE_TABS[tab]) return notFound();
+  await loadSpecies().catch(() => {});
+
+  const header = `
+    <a class="volver" href="#/game/${g.id}">← Pokémon ${g.name}</a>
+    <h1>Pokémon ${g.name} guide</h1>
+    <p class="subtitulo">${g.year} · ${g.platform} · ${guide.regions.map(r => regionById(r) ? `<a href="#/region/${r}">${regionById(r).name}</a>` : cap(r)).join(' & ')}</p>
+    <div class="pestanas">
+      ${Object.entries(GUIDE_TABS).map(([k, label]) => `<a href="#/guide/${g.id}/${k}" class="${k === tab ? 'activa' : ''}">${label}</a>`).join('')}
+    </div>`;
+
+  if (tab === 'walkthrough') return header + guideWalkthrough(guide);
+  if (tab === 'items') return header + guideItems(guide);
+  return guideLocations(g, guide, header);
+}
+
+function guideWalkthrough(guide) {
+  if (!guide.milestones.length) return '<p class="subtitulo">No walkthrough data for this game yet.</p>';
+  return guide.milestones.map(sec => `
+    <h2>${sec.title}</h2>
+    <div class="hitos">
+      ${sec.list.map((m, i) => `
+        <div class="tarjeta hito">
+          <div class="paso">${i + 1}</div>
+          <div>
+            <b>${m.who}</b> ${m.type ? typeBadge(m.type) : ''}
+            ${m.where ? `<div class="donde">📍 ${m.where}</div>` : ''}
+            ${m.reward ? `<div class="donde">🏅 ${m.reward}</div>` : ''}
+          </div>
+        </div>`).join('')}
+    </div>`).join('');
+}
+
+function guideItems(guide) {
+  const items = guide.items.length ? `
+    <div class="tabla-wrap">
+      <table class="comparar">
+        <thead><tr><th>Item</th><td><b>Where to get it</b></td></tr></thead>
+        <tbody>${guide.items.map(it => `<tr><th>${it.name}</th><td>${it.where}</td></tr>`).join('')}</tbody>
+      </table>
+    </div>` : '<p class="subtitulo">No key-item list for this game yet.</p>';
+
+  const gifts = guide.gifts.length ? `
+    <div class="regalos">
+      ${guide.gifts.map(gift => `
+        <a class="tarjeta regalo" href="#/pokemon/${gift.id}">
+          <img loading="lazy" src="${sprite(gift.id)}" alt="${nameOf(gift.id)}" ${imgFallback(gift.id)}>
+          <div><b>${nameOf(gift.id)}</b><div class="donde">${gift.where}</div></div>
+        </a>`).join('')}
+    </div>` : '<p class="subtitulo">No gift Pokémon listed for this game yet.</p>';
+
+  return `<h2>Key items & HMs</h2>${items}<h2>Gift Pokémon</h2>${gifts}`;
+}
+
+async function guideLocations(g, guide, header) {
+  const regions = await Promise.all(guide.regions.map(r => api(`/region/${r}`).catch(() => null)));
+  const routeNum = name => Number((name.match(/route-(\d+)/) || [])[1]);
+
+  const sections = regions.map((reg, i) => {
+    if (!reg || !reg.locations.length) {
+      return `<h2>${cap(guide.regions[i])}</h2><p class="subtitulo">PokeAPI has no location list for this region.</p>`;
+    }
+    const routes = reg.locations.filter(l => routeNum(l.name)).sort((a, b) => routeNum(a.name) - routeNum(b.name));
+    const places = reg.locations.filter(l => !routeNum(l.name)).sort((a, b) => placeName(a.name).localeCompare(placeName(b.name)));
+    const block = (title, locs) => locs.length ? `
+      <h3>${title} <small>(${locs.length})</small></h3>
+      ${locs.map(l => `
+        <details class="tarjeta desplegable lugar" data-loc="${l.name}">
+          <summary>${placeName(l.name)}</summary>
+          <div class="cuerpo-lugar"></div>
+        </details>`).join('')}` : '';
+    return `<h2>${regionById(reg.name) ? regionById(reg.name).name : cap(reg.name)}</h2>${block('Routes', routes)}${block('Towns, caves & other places', places)}`;
+  }).join('');
+
+  return {
+    html: `${header}
+      <p class="subtitulo">Open a location to see which wild Pokémon appear there in this game, how to find them and at what level. Encounter data comes from PokeAPI; newer games may have little or none.</p>
+      <div class="filtros"><input id="lugarQ" type="search" placeholder="Filter locations: Route 3, Mt. Moon…"></div>
+      ${sections}`,
+    mount() {
+      const q = document.getElementById('lugarQ');
+      q.oninput = () => {
+        const term = q.value.trim().toLowerCase();
+        document.querySelectorAll('.lugar').forEach(d => {
+          d.hidden = term && !d.querySelector('summary').textContent.toLowerCase().includes(term);
+        });
+      };
+      document.querySelectorAll('.lugar').forEach(d => {
+        d.addEventListener('toggle', () => {
+          if (!d.open || d.dataset.loaded) return;
+          d.dataset.loaded = '1';
+          const body = d.querySelector('.cuerpo-lugar');
+          body.innerHTML = loading();
+          locationEncounters(d.dataset.loc, g, guide)
+            .then(html => { body.innerHTML = html; })
+            .catch(() => { delete d.dataset.loaded; body.innerHTML = '<p class="error">Could not load this location. Close and reopen it to retry.</p>'; });
+        });
+      });
+    },
+  };
+}
+
+async function locationEncounters(slug, g, guide) {
+  const loc = await api(`/location/${slug}`);
+  const areas = await Promise.all(loc.areas.map(a => api(a.url)));
+  const labels = versionLabels(g, guide);
+
+  const html = areas.map(area => {
+    const rows = encounterRows(area.pokemon_encounters, guide.versions);
+    if (!rows.length) return '';
+    const sub = area.name.startsWith(loc.name + '-') ? placeName(area.name.slice(loc.name.length + 1)) : '';
+    return `
+      ${sub && sub !== 'Area' ? `<h4>${sub}</h4>` : ''}
+      <div class="tabla-wrap">
+        <table class="encuentros">
+          <thead><tr><th>Pokémon</th><th>Method</th><th>Levels</th><th>Rate</th></tr></thead>
+          <tbody>${rows.map(r => encounterRow(r, guide, labels)).join('')}</tbody>
+        </table>
+      </div>`;
+  }).join('');
+
+  return html || '<p class="subtitulo">No wild Pokémon recorded here for this game.</p>';
+}
+
+// Merge PokeAPI encounter slots into one row per Pokémon + method + conditions.
+function encounterRows(encounters, versions) {
+  const rows = new Map();
+  for (const e of encounters) {
+    const pid = idFromUrl(e.pokemon.url);
+    for (const vd of e.version_details) {
+      if (!versions.includes(vd.version.name)) continue;
+      for (const d of vd.encounter_details) {
+        const cond = d.condition_values.map(c => c.name).sort();
+        const key = `${pid}|${d.method.name}|${cond.join(',')}`;
+        let r = rows.get(key);
+        if (!r) rows.set(key, r = { pid, name: e.pokemon.name, method: d.method.name, cond, min: d.min_level, max: d.max_level, chance: {} });
+        r.min = Math.min(r.min, d.min_level);
+        r.max = Math.max(r.max, d.max_level);
+        r.chance[vd.version.name] = Math.min(100, (r.chance[vd.version.name] || 0) + d.chance);
+      }
+    }
+  }
+  return [...rows.values()].sort((a, b) => a.method.localeCompare(b.method) || a.pid - b.pid);
+}
+
+function encounterRow(r, guide, labels) {
+  const name = r.pid <= TOTAL ? nameOf(r.pid) : prettyName(r.name);
+  const img = `<img loading="lazy" src="${sprite(r.pid)}" alt="${name}">`;
+  const found = Object.keys(r.chance);
+  const only = guide.versions.length > 1 && found.length < guide.versions.length
+    ? found.map(v => `<span class="etiqueta">${labels[v]} only</span>`).join(' ') : '';
+  const rates = [...new Set(found.map(v => r.chance[v]))];
+  return `
+    <tr>
+      <td class="poke-celda">${r.pid <= TOTAL ? `<a href="#/pokemon/${r.pid}">${img}${name}</a>` : `${img}${name}`} ${only}</td>
+      <td>${prettyName(r.method)}${r.cond.length ? `<br><small>${r.cond.map(prettyName).join(', ')}</small>` : ''}</td>
+      <td>${r.min === r.max ? r.min : `${r.min}–${r.max}`}</td>
+      <td>${rates.map(c => `${c}%`).join(' / ')}</td>
+    </tr>`;
+}
+
+// ---------- Team builder ----------
+
+const TEAM_SIZE = 6;
+const TEAM_KEY = 'pokeinfo-team'; // not under STORE_PREFIX, so clearing the API cache keeps it
+
+function loadSavedTeam() {
+  try { return (JSON.parse(localStorage.getItem(TEAM_KEY)) || []).filter(Number.isInteger); } catch { return []; }
+}
+function saveTeam(ids) {
+  try { localStorage.setItem(TEAM_KEY, JSON.stringify(ids)); } catch { /* team just won't be remembered */ }
+}
+
+const TEAM_GAME_KEY = 'pokeinfo-team-game';
+function loadSavedGame() {
+  try { const g = localStorage.getItem(TEAM_GAME_KEY); return GUIDES[g] ? g : ''; } catch { return ''; }
+}
+function saveGame(gameId) {
+  try { localStorage.setItem(TEAM_GAME_KEY, gameId); } catch { /* not remembered */ }
+}
+const teamHash = (ids, gameId) => `#/team/${ids.join(',')}${gameId ? `/${gameId}` : ''}`;
+
+// Species in a game's regional Pokédex(es), or null if PokeAPI doesn't have them.
+async function gamePokedex(gameId) {
+  const vg = await api(`/version-group/${VERSION_GROUPS[gameId]}`);
+  const dexes = await Promise.all(vg.pokedexes.filter(d => d.name !== 'national').map(d => api(d.url)));
+  const ids = new Set(dexes.flatMap(d => d.pokemon_entries.map(e => idFromUrl(e.pokemon_species.url))).filter(id => id <= TOTAL));
+  return ids.size ? ids : null;
+}
+
+// A Pokémon's types as of a given generation (e.g. Clefairy was Normal before Gen 6).
+const ROMAN = { i: 1, ii: 2, iii: 3, iv: 4, v: 5, vi: 6, vii: 7, viii: 8, ix: 9 };
+function typesInGen(p, gen) {
+  const past = (p.past_types || [])
+    .map(pt => ({ gen: ROMAN[pt.generation.name.replace('generation-', '')], types: pt.types }))
+    .filter(pt => pt.gen >= gen)
+    .sort((a, b) => a.gen - b.gen)[0];
+  return (past ? past.types : p.types).map(t => t.type.name);
+}
+// Types that existed in a generation: Dark and Steel arrived in Gen 2, Fairy in Gen 6.
+const typesOfGen = gen => Object.keys(TYPE_CHART)
+  .filter(t => !(t === 'fairy' && gen < 6) && !((t === 'dark' || t === 'steel') && gen < 2));
+
+const MULT_LABEL = { 4: '×4', 2: '×2', 1: '', 0.5: '½', 0.25: '¼', 0: '0' };
+const MULT_CLASS = { 4: 'x4', 2: 'x2', 1: '', 0.5: 'x05', 0.25: 'x025', 0: 'x0' };
+
+async function team(param, gameParam) {
+  await loadSpecies();
+  // The URL is the source of truth so teams can be shared; #/team alone restores the saved one.
+  const ids = param === undefined
+    ? loadSavedTeam()
+    : [...new Set(param.split(',').map(Number))].filter(id => id >= 1 && id <= TOTAL).slice(0, TEAM_SIZE);
+  const gameId = param === undefined ? loadSavedGame() : (GUIDES[gameParam] ? gameParam : '');
+  saveTeam(ids);
+  saveGame(gameId);
+  if (param === undefined && (ids.length || gameId)) history.replaceState(null, '', teamHash(ids, gameId));
+
+  const game = gameById(gameId);
+  const gen = game ? game.gen : GENERATIONS.length;
+  const [mons, available] = await Promise.all([
+    Promise.all(ids.map(id => api(`/pokemon/${id}`))),
+    game ? gamePokedex(gameId).catch(() => null) : null,
+  ]);
+  const members = ids.map((id, i) => ({ id, types: typesInGen(mons[i], gen) }));
+  const go = (list, g = gameId) => { location.hash = teamHash(list, g); };
+  const pool = available ? [...available] : [...speciesNames.keys()];
+
+  const gameNote = !game ? ''
+    : available ? `Suggestions are limited to the ${available.size} Pokémon in the ${game.name} regional Pokédex. Some games let you catch more after the story.`
+    : `Couldn't load the ${game.name} Pokédex, so all Pokémon are suggested.`;
+
+  const slots = Array.from({ length: TEAM_SIZE }, (_, i) => {
+    const m = members[i];
+    if (!m) return '<div class="slot vacio">Empty slot</div>';
+    return `
+      <div class="tarjeta slot">
+        <button class="quitar" data-id="${m.id}" aria-label="Remove ${nameOf(m.id)}">✕</button>
+        <a href="#/pokemon/${m.id}"><img src="${sprite(m.id)}" alt="${nameOf(m.id)}" ${imgFallback(m.id)}></a>
+        <b>${nameOf(m.id)}</b>
+        <div class="tipos-fila">${m.types.map(typeBadge).join('')}</div>
+        ${available && !available.has(m.id) ? `<span class="etiqueta aviso">Not in ${game.name}</span>` : ''}
+      </div>`;
+  }).join('');
+
+  let analysis = '<p class="subtitulo">Add Pokémon to see your team\'s weaknesses and type coverage.</p>';
+  if (members.length) {
+    const allTypes = typesOfGen(gen);
+    const defs = members.map(m => defenses(m.types));
+    const rows = allTypes.map(atk => {
+      const vals = defs.map(d => d[atk]);
+      return { atk, vals, weak: vals.filter(v => v > 1).length, resist: vals.filter(v => v < 1).length };
+    });
+    const threats = rows.filter(r => r.weak >= 2 && r.weak > r.resist).sort((a, b) => b.weak - a.weak || a.resist - b.resist);
+    const covered = allTypes.filter(def => members.some(m => m.types.some(t => TYPE_CHART[t].double.includes(def))));
+    const uncovered = allTypes.filter(t => !covered.includes(t));
+
+    analysis = `
+      <div class="resumen">
+        <div class="tarjeta">
+          <h3>⚠️ Biggest threats</h3>
+          ${threats.length
+            ? threats.map(r => `<div class="amenaza">${typeBadge(r.atk)} <span>${r.weak} weak · ${r.resist} resist</span></div>`).join('')
+            : '<p class="subtitulo" style="margin:0">No type hits more than one of your Pokémon without being resisted. Nice balance!</p>'}
+        </div>
+        <div class="tarjeta">
+          <h3>🎯 Offensive coverage <small>${covered.length}/${allTypes.length}</small></h3>
+          <p class="nota" style="margin:0 0 8px">Types your team's own types hit super-effectively (same-type moves only).</p>
+          ${uncovered.length
+            ? `<div class="donde">Not covered:</div><div class="tipos-fila">${uncovered.map(typeBadge).join('')}</div>`
+            : '<p style="margin:0">Every type is covered!</p>'}
+        </div>
+      </div>
+
+      <h2>Weakness chart</h2>
+      <p class="subtitulo">Damage each attacking type deals to each team member.${gen < 6 ? ' Uses the modern type chart; a few matchups were different in older games.' : ''}</p>
+      <div class="tabla-wrap">
+        <table class="defensa">
+          <thead><tr><th>Attack</th>${members.map(m => `<th><img src="${sprite(m.id)}" alt="${nameOf(m.id)}" title="${nameOf(m.id)}"></th>`).join('')}<th>Weak</th><th>Resist</th></tr></thead>
+          <tbody>${rows.map(r => `
+            <tr>
+              <td>${typeBadge(r.atk)}</td>
+              ${r.vals.map(v => `<td class="${MULT_CLASS[v]}">${MULT_LABEL[v]}</td>`).join('')}
+              <td class="${r.weak >= 3 ? 'alerta' : ''}">${r.weak || ''}</td>
+              <td>${r.resist || ''}</td>
+            </tr>`).join('')}
+          </tbody>
+        </table>
+      </div>`;
+  }
+
+  return {
+    html: `
+      <h1>Team builder</h1>
+      <p class="subtitulo">Build a team of up to ${TEAM_SIZE} Pokémon and check its weaknesses. Your team is saved in this browser, and you can share the page link.</p>
+      <div class="filtros">
+        <select id="gameSel" aria-label="Game">
+          <option value="">Any game (all Pokémon)</option>
+          ${GAMES.filter(g => GUIDES[g.id]).map(g => `<option value="${g.id}" ${g.id === gameId ? 'selected' : ''}>${g.name} (${g.year})</option>`).join('')}
+        </select>
+      </div>
+      ${gameNote ? `<p class="nota" style="margin:-10px 0 16px">${gameNote}</p>` : ''}
+      <form class="filtros" id="addForm">
+        <input id="addQ" list="nombres" placeholder="${ids.length >= TEAM_SIZE ? 'Team is full' : 'Add a Pokémon: name or number…'}" ${ids.length >= TEAM_SIZE ? 'disabled' : ''}>
+        <datalist id="nombres">${pool.map(id => `<option value="${nameOf(id)}">`).join('')}</datalist>
+        <button class="btn" ${ids.length >= TEAM_SIZE ? 'disabled' : ''}>Add</button>
+        <button type="button" class="btn sec" id="randomTeam">🎲 Random team</button>
+        ${ids.length ? '<button type="button" class="btn sec" id="clearTeam">Clear</button>' : ''}
+      </form>
+      <div class="equipo">${slots}</div>
+      ${analysis}`,
+    mount() {
+      const q = document.getElementById('addQ');
+      const byName = new Map([...speciesNames].map(([id, n]) => [n.toLowerCase(), id]));
+      const add = () => {
+        const text = q.value.trim().toLowerCase().replace(/^#0*/, '');
+        const id = byName.get(text) || (Number(text) >= 1 && Number(text) <= TOTAL ? Number(text) : null);
+        const problem = !id ? 'No Pokémon with that name or number.'
+          : available && !available.has(id) ? `${nameOf(id)} isn't in the ${game.name} regional Pokédex.` : '';
+        if (problem) { q.setCustomValidity(problem); q.reportValidity(); return; }
+        go([...new Set([...ids, id])]);
+      };
+      document.getElementById('gameSel').onchange = e => go(ids, e.target.value);
+      q.oninput = () => q.setCustomValidity('');
+      q.onchange = () => { if (byName.has(q.value.trim().toLowerCase())) add(); };
+      document.getElementById('addForm').onsubmit = e => { e.preventDefault(); add(); };
+      document.querySelectorAll('.quitar').forEach(b => {
+        b.onclick = () => go(ids.filter(id => id !== Number(b.dataset.id)));
+      });
+      document.getElementById('randomTeam').onclick = () => {
+        const pick = new Set();
+        while (pick.size < Math.min(TEAM_SIZE, pool.length)) pick.add(pool[Math.floor(Math.random() * pool.length)]);
+        go([...pick]);
+      };
+      const clear = document.getElementById('clearTeam');
+      if (clear) clear.onclick = () => go([]);
+    },
+  };
+}
+
+function notFound() {
+  return `<div class="error"><h1>Page not found</h1><p>That page doesn't exist.</p><a class="btn" href="#/">Go home</a></div>`;
+}
+
+// ---------- Router ----------
+
+const ROUTES = {
+  '': home, pokedex, pokemon: pokemonDetail,
+  regions, region: regionDetail,
+  games, game: gameDetail, compare,
+  guides, guide: guideView, team,
+};
+const NAV_SECTION = { pokemon: 'pokedex', region: 'regions', game: 'games', guide: 'guides' };
+let renderToken = 0;
+
+async function router() {
+  const [route = '', ...params] = location.hash.replace(/^#\/?/, '').split('/').map(decodeURIComponent);
+  const section = NAV_SECTION[route] || route;
+  document.querySelectorAll('#nav a').forEach(a => a.classList.toggle('activo', a.dataset.route === section));
+  document.getElementById('nav').classList.remove('abierto');
+
+  const token = ++renderToken;
+  const view = ROUTES[route] || notFound;
+  app.innerHTML = loading();
+  window.scrollTo(0, 0);
+
+  try {
+    const result = await view(...params);
+    if (token !== renderToken) return; // a newer navigation took over
+    const { html, mount } = typeof result === 'string' ? { html: result } : result;
+    app.innerHTML = html;
+    if (mount) mount();
+  } catch (err) {
+    if (token !== renderToken) return;
+    console.error(err);
+    app.innerHTML = `<div class="error"><h2>Something went wrong</h2><p>Could not load the data. Check your internet connection and try again.</p>
+      <button class="btn" onclick="router()">Retry</button></div>`;
+  }
+}
+
+document.getElementById('menuBtn').onclick = () => document.getElementById('nav').classList.toggle('abierto');
+window.addEventListener('hashchange', router);
+router();
