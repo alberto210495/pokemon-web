@@ -56,7 +56,7 @@ PokeAPI responses are cached in the browser for 7 days, so pages you have visite
 **Known gaps**
 
 - PokeAPI's encounter data is thorough for the older games but patchy or missing for newer ones. Those locations show "No wild Pokémon recorded".
-- Key-item lists are still empty for Black & White, Black 2 & White 2 and Scarlet & Violet, and Legends: Z-A has no walkthrough yet.
+- Key items and gift Pokémon are still empty for Legends: Arceus, Black & White, Black 2 & White 2 and Scarlet & Violet. Legends: Z-A has no guide data at all yet.
 - The team builder uses the modern type chart. A few matchups were different in older games.
 
 ### Adding guide data
